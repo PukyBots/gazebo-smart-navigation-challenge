@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from gazebo_msgs.srv import DeleteEntity
 import json
 import math
 import time
@@ -18,6 +19,9 @@ class Navigator(Node):
         
         self.current_pose = None
         self.current_yaw = 0.0
+
+        self.start_time = self.get_clock().now()
+        self.time_limit = 30.0
         
         # Grid parameters
         self.grid_rows = 5
@@ -46,14 +50,35 @@ class Navigator(Node):
         self.get_logger().info(f"Planned route (grid coordinates): {self.route}")
         
         self.path_points = self.expand_path(self.route)
-        self.get_logger().info(f"Target world coordinates: {self.path_points}")
+        self.get_logger().info(f"Target world coordinates (len={len(self.path_points)}): {self.path_points}")
         
+        if not self.path_points:
+            self.get_logger().error("NO VALID PATH FOUND! Obstacles are blocking all possible routes. Please restart.")
+            self.active = False
+            return
+            
         self.target_idx = 0
         
         # PID constants
-        self.kp_linear = 0.5
-        self.kp_angular = 2.0
+        self.kp_linear = 3.0
+        self.kp_angular = 4.0
         self.active = True
+        self.all_bonuses_collected = False
+        
+        # Startup pause: hold at start point for 5 seconds before moving
+        self.startup_delay = 5.0
+        self.navigation_started = False
+        self.startup_time = None  # Will be set on first odom message (when robot is actually alive)
+        
+        self.delete_client = self.create_client(DeleteEntity, '/delete_entity')
+        self.bonus_models = []
+        for i, (r, c) in enumerate(self.bonuses):
+            self.bonus_models.append({
+                'name': f'bonus_{i+1}',
+                'x': float(c - 2),
+                'y': float(2 - r),
+                'collected': False
+            })
         
         self.timer = self.create_timer(0.1, self.control_loop)
 
@@ -116,18 +141,26 @@ class Navigator(Node):
                         came_from[nxt] = current
         return None
 
+    def grid_to_world(self, cell):
+        """Convert a grid (row, col) cell to Gazebo world (x, y) coordinates."""
+        return (float(cell[1] - 2), float(2 - cell[0]))
+
     def expand_path(self, route):
-        """Convert grid route to world coordinates."""
+        """Convert grid route to world coordinates, beginning explicitly from the start."""
         world_path = []
-        curr = route[0]
+        
+        # *** CRITICAL FIX: Always include the start position as the very first waypoint.
+        # A* omits the start cell from its returned path, so without this the robot's
+        # first target is the SECOND cell — making it look like it starts mid-grid. ***
+        start_cell = route[0]
+        world_path.append(self.grid_to_world(start_cell))
+        
+        curr = start_cell
         for next_cell in route[1:]:
             segment = self.astar(curr, next_cell)
             if segment:
                 for cell in segment:
-                    # In Gazebo, 0,0 grid is top left (-2.0, 2.0). 
-                    # X map: col=0 -> -2, col=1 -> -1, ..., col=4 -> 2
-                    # Y map: row=0 -> 2, row=1 -> 1, ..., row=4 -> -2
-                    world_path.append((float(cell[1] - 2), float(2 - cell[0])))
+                    world_path.append(self.grid_to_world(cell))
                 curr = next_cell
         return world_path
 
@@ -138,6 +171,11 @@ class Navigator(Node):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        # Start the pause timer on the FIRST odom message (robot is now alive in Gazebo)
+        if self.startup_time is None:
+            self.startup_time = self.get_clock().now()
+            self.get_logger().info("Robot detected at start point. Holding position...")
 
     def control_loop(self):
         if not self.active:
@@ -146,11 +184,62 @@ class Navigator(Node):
         if self.current_pose is None:
             return
             
+        current_time = self.get_clock().now()
+        
+        # --- STARTUP PAUSE ---
+        # Hold at the start point for startup_delay seconds before beginning
+        if not self.navigation_started:
+            startup_elapsed = (current_time - self.startup_time).nanoseconds / 1e9
+            remaining = self.startup_delay - startup_elapsed
+            if remaining > 0:
+                # Publish zero velocity to hold robot still
+                self.publisher_.publish(Twist())
+                if int(remaining) != getattr(self, '_last_countdown', -1):
+                    self._last_countdown = int(remaining)
+                    self.get_logger().info(f"Starting in {int(remaining)+1}...")
+                return
+            else:
+                self.navigation_started = True
+                self.start_time = self.get_clock().now()  # Reset main timer AFTER pause
+                self.get_logger().info("GO! Robot beginning navigation from start point.")
+        # ---------------------
+        
+        elapsed = (current_time - self.start_time).nanoseconds / 1e9
+        if elapsed > self.time_limit:
+            self.get_logger().warn("Time limit exceeded, stopping the robot.")
+            self.handle_timeout()
+            return
+
+        # Check if we collected any bonuses
+        for b in self.bonus_models:
+            if not b['collected']:
+                bdx = b['x'] - self.current_pose.x
+                bdy = b['y'] - self.current_pose.y
+                if math.sqrt(bdx**2 + bdy**2) < 0.25:
+                    b['collected'] = True
+                    self.get_logger().info(f"Collecting {b['name']}!")
+                    self.delete_entity(b['name'])
+                    # Check if that was the last one
+                    if not self.all_bonuses_collected and all(bm['collected'] for bm in self.bonus_models):
+                        self.all_bonuses_collected = True
+                        self.time_limit = 30.0
+                        self.start_time = self.get_clock().now()
+                        self.get_logger().info("All bonuses collected! 30s timer reset for goal arrival")
+                    
         if self.target_idx >= len(self.path_points):
-            stop_msg = Twist()
-            self.publisher_.publish(stop_msg)
-            self.get_logger().info("Goal Reached!")
-            self.active = False
+            # Only declare goal reached if we're physically near the goal world position (2, -2)
+            goal_x, goal_y = self.grid_to_world(self.goal)
+            gdx = goal_x - self.current_pose.x
+            gdy = goal_y - self.current_pose.y
+            if math.sqrt(gdx**2 + gdy**2) < 0.3:
+                stop_msg = Twist()
+                self.publisher_.publish(stop_msg)
+                self.get_logger().info("Goal Reached!")
+                self.active = False
+            else:
+                # Path exhausted but not at goal — layout likely blocked, keep active
+                self.get_logger().warn("Path exhausted but not at goal — layout may be blocked. Please restart.")
+                self.active = False
             return
 
         target_x, target_y = self.path_points[self.target_idx]
@@ -168,23 +257,38 @@ class Navigator(Node):
         msg = Twist()
         
         # If reached point
-        if dist < 0.15:
+        if dist < 0.12:
             self.target_idx += 1
-            self.get_logger().info(f"Target {self.target_idx}/{len(self.path_points)} reached")
+            self.get_logger().info(f"Target {self.target_idx}/{len(self.path_points)} reached. Robot pose is x={self.current_pose.x:.2f}, y={self.current_pose.y:.2f}")
         else:
-            # If yaw error is large, turn towards the goal first before moving
-            if abs(yaw_err) > 0.15:
-                # Turn with cap to avoid spinning out of control
-                msg.angular.z = max(-1.2, min(1.2, self.kp_angular * yaw_err))
-                msg.linear.x = 0.0
-            else:
-                # Move forward, capped linear speed
-                msg.linear.x = max(0.05, min(self.kp_linear * dist, 0.25))
-                # Slight heading corrections on the move
-                msg.angular.z = max(-0.8, min(0.8, self.kp_angular * yaw_err))
+            # --- SMOOTH ARC / FLOW MOVEMENT ---
+            # Scale forward speed DOWN when angle error is large (don't cut corners sharp)
+            # Scale it UP to max when aligned. This creates smooth arcs like a real line follower.
+            angle_factor = max(0.0, 1.0 - (abs(yaw_err) / (math.pi / 4)))
+            
+            msg.linear.x  = max(0.15, min(self.kp_linear * dist, 2.0)) * angle_factor
+            msg.angular.z = max(-5.0, min(5.0, self.kp_angular * yaw_err))
+            # --------------------------------
             
         self.publisher_.publish(msg)
 
+    def delete_entity(self, name):
+        if not self.delete_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(f"DeleteEntity service not available to delete {name}")
+            return
+            
+        req = DeleteEntity.Request()
+        req.name = name
+        self.delete_client.call_async(req)
+
+    def handle_timeout(self):
+        self.get_logger().warn('time limit exceeded stopping the robot.')  
+        stop_msg= Twist()
+        stop_msg.linear.x =0.0
+        stop_msg.angular.z =0.0
+        self.publisher_.publish(stop_msg)
+        self.active = False
+         
 def main(args=None):
     rclpy.init(args=args)
     navigator = Navigator()
